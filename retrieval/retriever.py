@@ -6,8 +6,9 @@ This module only retrieves relevant chunks. It does not call an LLM, rewrite
 queries, or generate answers — those are implemented in later phases.
 """
 
+import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.documents import Document
 
@@ -83,10 +84,14 @@ class DocumentRetriever:
         """Return the top_k most relevant chunks for query, most relevant first.
 
         Pass document_hash to restrict the search to one uploaded document;
-        omit it (default) to search across all indexed documents. Returns an
-        empty list if the vector store has no indexed chunks (or none match
-        an optional document_hash filter) — this never crashes and never
-        calls an answer-generation LLM.
+        omit it (default) to search across all indexed documents — in that
+        case, every indexed document is guaranteed a fair share of the
+        candidate pool (see _search_across_all_documents), so a broad
+        question ("tell me about both documents") isn't accidentally
+        answered from just one of them. Returns an empty list if the vector
+        store has no indexed chunks (or none match an optional
+        document_hash filter) — this never crashes and never calls an
+        answer-generation LLM.
         """
         validated_query = self._validate_query(query)
 
@@ -99,9 +104,12 @@ class DocumentRetriever:
             raise RetrievalError("document_hash must be a non-empty string when provided.")
 
         try:
-            results = self._vector_store.similarity_search(
-                validated_query, top_k=effective_top_k, document_hash=document_hash
-            )
+            if document_hash is not None:
+                results = self._vector_store.similarity_search(
+                    validated_query, top_k=effective_top_k, document_hash=document_hash
+                )
+            else:
+                results = self._search_across_all_documents(validated_query, effective_top_k)
         except VectorStoreError as exc:
             logger.error("Retrieval search failed (%s).", type(exc).__name__)
             raise RetrievalError(
@@ -109,6 +117,50 @@ class DocumentRetriever:
             ) from exc
 
         return [self._to_retrieved_chunk(document, distance) for document, distance in results]
+
+    def _search_across_all_documents(
+        self, query: str, top_k: int
+    ) -> List[Tuple[Document, float]]:
+        """Search every indexed document and return the best top_k overall,
+        guaranteeing each document a fair share of the candidate pool.
+
+        A single flat nearest-neighbor search across the whole collection
+        has no guarantee that every indexed document is represented in the
+        results — for a broad or generic query, all top_k matches can
+        happen to come from just one document, silently excluding the
+        others from the answer's context. To avoid that, this queries each
+        document individually (via the existing document_hash filter) for
+        its own best ceil(top_k / num_documents) chunks, merges every
+        document's candidates, and returns the globally best top_k by
+        distance. Whenever top_k >= the number of indexed documents, every
+        document is guaranteed to contribute at least one candidate to that
+        merged pool. With 0 or 1 indexed documents there's nothing to
+        diversify, so this falls back to a single plain search.
+        """
+        try:
+            indexed_documents = self._vector_store.list_documents()
+        except VectorStoreError as exc:
+            logger.warning(
+                "Could not enumerate indexed documents for diversified retrieval; "
+                "falling back to a single combined search (%s).",
+                type(exc).__name__,
+            )
+            indexed_documents = []
+
+        if len(indexed_documents) <= 1:
+            return self._vector_store.similarity_search(query, top_k=top_k)
+
+        per_document_quota = math.ceil(top_k / len(indexed_documents))
+        candidates: List[Tuple[Document, float]] = []
+        for document in indexed_documents:
+            candidates.extend(
+                self._vector_store.similarity_search(
+                    query, top_k=per_document_quota, document_hash=document.document_hash
+                )
+            )
+
+        candidates.sort(key=lambda candidate: candidate[1])
+        return candidates[:top_k]
 
     @staticmethod
     def _to_retrieved_chunk(document: Document, distance: float) -> RetrievedChunk:

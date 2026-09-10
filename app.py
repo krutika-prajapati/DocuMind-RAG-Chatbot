@@ -29,7 +29,6 @@ from utils.validation import EmptyFileError, FileTooLargeError, UnsupportedFileT
 logger = get_logger(__name__)
 
 SUPPORTED_FORMATS_LABEL = "PDF · DOCX · TXT · Markdown"
-SOURCE_PREVIEW_CHARS = 300
 
 INGESTION_ERRORS = (
     UnsupportedFileTypeError,
@@ -157,73 +156,14 @@ def _clear_conversation() -> None:
     st.session_state.chat_messages = []
 
 
-def _render_sources(sources, retrieved_chunks) -> None:
-    """Render deterministic, application-generated source citations.
-
-    Chunk previews are shown with st.code() — as inert data, never
-    interpreted as Markdown/HTML — since retrieved document content is
-    untrusted (the same principle applied to the Gemini prompt itself).
-    """
-    if not sources:
-        return
-    with st.expander(f"📎 View sources ({len(sources)})"):
-        for index, source in enumerate(sources, start=1):
-            location = f"Page {source.page}" if source.page is not None else "N/A"
-            st.markdown(
-                f"**{index}. 📄 {source.file_name or 'unknown'}** — "
-                f"{location} · Chunk {source.chunk_index}"
-            )
-            if index - 1 < len(retrieved_chunks):
-                preview = retrieved_chunks[index - 1].page_content[:SOURCE_PREVIEW_CHARS]
-                st.code(preview, language=None)
-            if index < len(sources):
-                st.divider()
-
-
-def _render_answer_details(entry: dict) -> None:
-    """A light, non-technical view of the RAG pipeline for this answer."""
-    with st.expander("🔍 How this answer was generated"):
-        st.markdown(
-            "Question → Conversation-aware query → Semantic retrieval → "
-            "Retrieved document chunks → Gemini → Grounded answer"
-        )
-        st.markdown(f"- **Original question:** {entry.get('original_query') or '—'}")
-        retrieval_query = entry.get("retrieval_query")
-        original_query = entry.get("original_query")
-        if retrieval_query and retrieval_query != original_query:
-            st.markdown(f"- **Rewritten search query:** {retrieval_query}")
-        st.markdown(f"- **Chunks retrieved:** {entry.get('num_chunks', 0)}")
-
-
-def _render_retrieval_details(entry: dict) -> None:
-    """Collapsed, developer-oriented retrieval debug info. No secrets, no prompts."""
-    chunks = entry.get("retrieved_chunks") or []
-    with st.expander("🛠️ Retrieval details"):
-        st.markdown(f"- **Retrieval query:** {entry.get('retrieval_query') or '—'}")
-        st.markdown(f"- **Top K:** {entry.get('top_k')}")
-        if not chunks:
-            st.caption("No chunks were retrieved for this turn.")
-            return
-        rows = [
-            {
-                "Source": chunk.file_name or "unknown",
-                "Page": chunk.page if chunk.page is not None else "—",
-                "Chunk #": chunk.chunk_index,
-                "Distance": round(chunk.distance, 4),
-            }
-            for chunk in chunks
-        ]
-        st.dataframe(rows, width="stretch", hide_index=True)
-
-
 def _render_assistant_message(entry: dict) -> None:
+    """Render an assistant message: answer text only, nothing else.
+
+    Source/retrieval metadata is still captured in the entry itself (see
+    where chat_messages entries are built below) for internal/future use —
+    it is simply never rendered in the chat UI.
+    """
     st.write(entry["content"])
-    _render_sources(entry.get("sources") or [], entry.get("retrieved_chunks") or [])
-    if entry.get("num_chunks") is not None:
-        st.caption(f"Sources used: {entry['num_chunks']}")
-    if entry.get("has_pipeline_details"):
-        _render_answer_details(entry)
-        _render_retrieval_details(entry)
 
 
 # --- Page setup -------------------------------------------------------------
@@ -408,8 +348,6 @@ if question:
                     "original_query": response.original_query,
                     "retrieval_query": response.retrieval_query,
                     "num_chunks": len(response.retrieved_chunks),
-                    "top_k": st.session_state.top_k,
-                    "has_pipeline_details": True,
                 }
                 _render_assistant_message(entry)
                 st.session_state.chat_messages.append(entry)

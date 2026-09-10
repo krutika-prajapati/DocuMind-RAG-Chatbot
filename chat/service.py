@@ -18,6 +18,7 @@ DocumentRetriever, QueryRewriter, and GeminiChatService.
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from chat.conversational import detect_conversational_reply
 from chat.memory import ConversationMemory
 from llm.gemini import GeminiChatError, GeminiChatService
 from llm.prompts import NO_ANSWER_FALLBACK, build_rag_prompt
@@ -105,8 +106,26 @@ class RAGService:
 
         Returns RAGResponse(answer=NO_ANSWER_FALLBACK, sources=[]) without
         calling Gemini for an answer if no chunks are retrieved.
+
+        Simple conversational messages (greetings, thanks, farewells, "how
+        are you") are detected before query rewriting/retrieval and answered
+        directly with a short canned reply — no query rewriting, retrieval,
+        or Gemini call happens for these, and they are not recorded into
+        `memory`. A message that combines a greeting with an actual
+        question (e.g. "Hi, what is the file size limit?") is not affected
+        by this and still goes through the full grounded RAG flow.
         """
         validated_query = self._validate_query(query)
+
+        conversational_reply = detect_conversational_reply(validated_query)
+        if conversational_reply is not None:
+            return RAGResponse(
+                answer=conversational_reply,
+                sources=[],
+                retrieved_chunks=[],
+                original_query=validated_query,
+                retrieval_query=None,
+            )
 
         history = memory.get_recent_messages() if memory is not None else []
         try:

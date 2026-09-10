@@ -300,6 +300,181 @@ def test_secrets_are_not_exposed_in_retrieval_errors(populated_store, monkeypatc
     assert fake_secret not in caplog.text
 
 
+# --- Multi-document diversification (broad/generic queries must not be
+# accidentally answered from just one indexed document) ---------------
+
+
+class DominantMinorityEmbeddingService:
+    """Deterministic embedding for constructing a controlled "one document
+    dominates a flat top-k search" scenario.
+
+    Text starting with "CLOSE" embeds near the origin; text starting with
+    "FAR" embeds far away; anything else (a neutral/broad query) embeds at
+    the origin, so it is equally "close" to every CLOSE-tagged chunk and
+    equally "far" from every FAR-tagged chunk.
+    """
+
+    def embed_texts(self, texts):
+        return [self._vector(text) for text in texts]
+
+    def embed_text(self, text):
+        return self._vector(text)
+
+    @staticmethod
+    def _vector(text: str):
+        if text.startswith("CLOSE"):
+            return [0.1, 0.0]
+        if text.startswith("FAR"):
+            return [10.0, 0.0]
+        return [0.0, 0.0]
+
+
+def _make_dominant_minority_store(tmp_path, dominant_count=5, minority_count=2):
+    """A knowledge base with one "dominant" document (many CLOSE chunks)
+    and one "minority" document (few FAR chunks) — a flat top-k search for
+    a neutral/broad query returns only the dominant document's chunks
+    unless retrieval diversifies across documents.
+    """
+    store = ChromaVectorStore(
+        embedding_service=DominantMinorityEmbeddingService(),
+        persist_directory=tmp_path,
+        collection_name="dominant_minority_tests",
+    )
+    chunks = []
+    for i in range(dominant_count):
+        chunks.append(
+            _make_chunk(
+                f"CLOSE: dominant document chunk {i} about general operations.",
+                f"dom-{i}",
+                "doc-dominant",
+                source="dominant.txt",
+                file_name="dominant.txt",
+                file_type="txt",
+                chunk_index=i,
+                chunk_size=10,
+            )
+        )
+    for i in range(minority_count):
+        chunks.append(
+            _make_chunk(
+                f"FAR: minority document chunk {i} about a completely different topic.",
+                f"min-{i}",
+                "doc-minority",
+                source="minority.txt",
+                file_name="minority.txt",
+                file_type="txt",
+                chunk_index=i,
+                chunk_size=10,
+            )
+        )
+    store.add_chunks(chunks)
+    return store
+
+
+def test_flat_search_alone_would_exclude_the_minority_document(tmp_path):
+    """Sanity check proving the underlying bug is real at the raw-search
+    layer (bypassing DocumentRetriever's diversification entirely) — the
+    minority document's chunks are completely absent from a flat top-k
+    search for a broad/neutral query.
+    """
+    store = _make_dominant_minority_store(tmp_path)
+
+    raw_results = store.similarity_search("QUERY: broad neutral question", top_k=3)
+
+    document_hashes = {doc.metadata["document_hash"] for doc, _ in raw_results}
+    assert document_hashes == {"doc-dominant"}
+
+
+def test_broad_query_includes_every_indexed_document(tmp_path):
+    store = _make_dominant_minority_store(tmp_path)
+    retriever = DocumentRetriever(vector_store=store)
+
+    results = retriever.retrieve("QUERY: broad neutral question", top_k=3)
+
+    document_hashes = {chunk.document_hash for chunk in results}
+    assert document_hashes == {"doc-dominant", "doc-minority"}
+    assert len(results) == 3
+
+
+def test_diversified_results_are_still_sorted_by_distance(tmp_path):
+    store = _make_dominant_minority_store(tmp_path)
+    retriever = DocumentRetriever(vector_store=store)
+
+    results = retriever.retrieve("QUERY: broad neutral question", top_k=3)
+
+    distances = [chunk.distance for chunk in results]
+    assert distances == sorted(distances)
+
+
+def test_query_specific_to_one_document_still_ranks_it_first(tmp_path):
+    """Diversification must not weaken precision: a query that clearly
+    matches one document's content still ranks that document's chunks
+    first, even though the other document is now also represented.
+    """
+    store = _make_dominant_minority_store(tmp_path)
+    retriever = DocumentRetriever(vector_store=store)
+
+    results = retriever.retrieve("FAR: a question specifically about the minority topic", top_k=3)
+
+    assert results[0].document_hash == "doc-minority"
+
+
+def test_single_document_knowledge_base_is_unaffected(tmp_path):
+    store = ChromaVectorStore(
+        embedding_service=DominantMinorityEmbeddingService(), persist_directory=tmp_path
+    )
+    store.add_chunks(
+        [
+            _make_chunk(
+                "CLOSE: the only document's only chunk.",
+                "only-1",
+                "doc-only",
+                file_name="only.txt",
+                file_type="txt",
+                chunk_index=0,
+            )
+        ]
+    )
+    retriever = DocumentRetriever(vector_store=store)
+
+    results = retriever.retrieve("QUERY: anything", top_k=5)
+
+    assert len(results) == 1
+    assert results[0].document_hash == "doc-only"
+
+
+def test_explicit_document_hash_filter_bypasses_diversification(tmp_path):
+    """Requesting one specific document (document_hash filter) must behave
+    exactly as before — only that document's chunks are ever returned.
+    """
+    store = _make_dominant_minority_store(tmp_path)
+    retriever = DocumentRetriever(vector_store=store)
+
+    results = retriever.retrieve(
+        "QUERY: broad neutral question", top_k=3, document_hash="doc-minority"
+    )
+
+    assert len(results) > 0
+    assert all(chunk.document_hash == "doc-minority" for chunk in results)
+
+
+def test_diversification_falls_back_to_flat_search_if_listing_documents_fails(
+    tmp_path, monkeypatch
+):
+    store = _make_dominant_minority_store(tmp_path)
+    retriever = DocumentRetriever(vector_store=store)
+
+    def explode(*args, **kwargs):
+        raise VectorStoreError("cannot list documents")
+
+    monkeypatch.setattr(store, "list_documents", explode)
+
+    results = retriever.retrieve("QUERY: broad neutral question", top_k=3)
+
+    # Degrades gracefully to a plain flat search rather than crashing.
+    assert len(results) == 3
+
+
 def test_end_to_end_chunk_embed_store_query_retrieve(tmp_path):
     """Integration test: chunk -> (mocked) embed -> Chroma -> query -> retrieve."""
     from ingestion.chunking import chunk_documents

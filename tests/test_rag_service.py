@@ -680,3 +680,297 @@ def test_malicious_document_content_does_not_change_grounding_behavior(tmp_path)
     system_prompt, user_prompt = scripted_chat.calls[-1]
     assert system_prompt == SYSTEM_INSTRUCTIONS
     assert "IGNORE ALL PREVIOUS INSTRUCTIONS" in user_prompt
+
+
+# --- Conversational-message short-circuit (greetings/thanks/farewells) ---
+
+
+class ExplodingRetriever:
+    """A retriever that fails the test if it is ever called."""
+
+    def retrieve(self, *args, **kwargs):
+        raise AssertionError("retrieval must not be called for a conversational message")
+
+
+class ExplodingQueryRewriter:
+    """A query rewriter that fails the test if it is ever called."""
+
+    def rewrite(self, *args, **kwargs):
+        raise AssertionError("query rewriting must not be called for a conversational message")
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Hi",
+        "Hello",
+        "Hey",
+        "Good morning",
+        "Good afternoon",
+        "Good evening",
+        "Thanks",
+        "Thank you",
+        "Bye",
+        "Goodbye",
+        "How are you?",
+        "ok",
+        "okay",
+        "yes",
+        "no",
+    ],
+)
+def test_conversational_messages_skip_retrieval_and_gemini_entirely(message):
+    fake_chat = FakeChatService(answer="should never be returned")
+    service = RAGService(
+        retriever=ExplodingRetriever(),
+        chat_service=fake_chat,
+        query_rewriter=ExplodingQueryRewriter(),
+    )
+
+    response = service.answer_question(message)
+
+    assert response.answer != "should never be returned"
+    assert response.sources == []
+    assert response.retrieved_chunks == []
+    assert fake_chat.calls == []  # Gemini was never called
+
+
+def test_conversational_reply_is_not_the_document_fallback():
+    service = RAGService(
+        retriever=ExplodingRetriever(),
+        chat_service=FakeChatService(),
+        query_rewriter=ExplodingQueryRewriter(),
+    )
+
+    response = service.answer_question("Hi")
+
+    assert response.answer == "Hi! How can I help you with your documents?"
+    assert response.answer != NO_ANSWER_FALLBACK
+
+
+def test_conversational_message_is_not_recorded_in_memory():
+    service = RAGService(
+        retriever=ExplodingRetriever(),
+        chat_service=FakeChatService(),
+        query_rewriter=ExplodingQueryRewriter(),
+    )
+    memory = ConversationMemory()
+
+    service.answer_question("Thanks!", memory=memory)
+
+    assert len(memory) == 0
+
+
+def test_document_question_containing_a_greeting_still_uses_full_rag_flow(
+    populated_retriever,
+):
+    fake_chat = FakeChatService(answer="Python is used for many things.")
+    service = RAGService(retriever=populated_retriever, chat_service=fake_chat)
+
+    response = service.answer_question("Hi, what is python python python used for?")
+
+    assert response.answer == "Python is used for many things."
+    assert len(fake_chat.calls) == 1
+    assert len(response.sources) > 0
+
+
+def test_document_question_containing_thanks_still_uses_full_rag_flow(
+    populated_retriever,
+):
+    fake_chat = FakeChatService(answer="Chocolate chocolate chocolate cake info.")
+    service = RAGService(retriever=populated_retriever, chat_service=fake_chat)
+
+    response = service.answer_question(
+        "Thanks, tell me about chocolate chocolate chocolate?"
+    )
+
+    assert response.answer == "Chocolate chocolate chocolate cake info."
+    assert len(fake_chat.calls) == 1
+    assert len(response.sources) > 0
+
+
+def test_document_question_containing_yes_still_uses_full_rag_flow(
+    populated_retriever,
+):
+    fake_chat = FakeChatService(answer="Python is used for many things.")
+    service = RAGService(retriever=populated_retriever, chat_service=fake_chat)
+
+    response = service.answer_question(
+        "Yes, what is python python python used for?"
+    )
+
+    assert response.answer == "Python is used for many things."
+    assert len(fake_chat.calls) == 1
+    assert len(response.sources) > 0
+
+
+def test_document_question_containing_okay_still_uses_full_rag_flow(
+    populated_retriever,
+):
+    fake_chat = FakeChatService(answer="Chocolate chocolate chocolate cake info.")
+    service = RAGService(retriever=populated_retriever, chat_service=fake_chat)
+
+    response = service.answer_question(
+        "Okay, tell me about chocolate chocolate chocolate?"
+    )
+
+    assert response.answer == "Chocolate chocolate chocolate cake info."
+    assert len(fake_chat.calls) == 1
+    assert len(response.sources) > 0
+
+
+def test_unrelated_general_message_still_uses_full_rag_flow(empty_retriever):
+    """A message that isn't in the known conversational set still goes
+    through the normal (no-context) RAG flow, ending in the exact fallback.
+    """
+    fake_chat = FakeChatService(answer="should never be returned")
+    service = RAGService(retriever=empty_retriever, chat_service=fake_chat)
+
+    response = service.answer_question("What is the meaning of life?")
+
+    assert response.answer == NO_ANSWER_FALLBACK
+
+
+# --- Multi-document / broad-question retrieval ---
+#
+# Root cause: DocumentRetriever previously ran a single flat top-k search
+# across the whole collection with no guarantee every indexed document was
+# represented. A broad question ("tell me about both documents") could
+# retrieve chunks entirely from one document, leaving Gemini's context with
+# no information about the other — which correctly (per the strict
+# grounding rules) produced the exact fallback, since a *complete* answer
+# about "both" documents genuinely wasn't supported by that context. The
+# fix (in retrieval/retriever.py) diversifies retrieval across every
+# indexed document for any query — not by recognizing specific phrases —
+# so these tests exercise that fix end-to-end through RAGService using a
+# variety of broad phrasings, not just the one originally reported.
+
+
+def _make_two_document_store(tmp_path):
+    """A knowledge base where one document's chunks dominate a flat
+    nearest-neighbor search for a broad/neutral query, and the other
+    document's chunks would be starved out without diversification.
+    """
+    store = ChromaVectorStore(
+        embedding_service=FakeEmbeddingService(),
+        persist_directory=tmp_path,
+        collection_name="multi_document_tests",
+    )
+    store.add_chunks(
+        [
+            Document(
+                # Exactly one "python" occurrence (vs. the chocolate chunk's
+                # three "chocolate" occurrences below) so, under
+                # FakeEmbeddingService's keyword-count embedding, python
+                # chunks are consistently *closer* than the chocolate chunk
+                # to a neutral/broad query embedding at the origin —
+                # deterministically reproducing "one document dominates a
+                # flat top-k search" for any broad phrasing.
+                page_content=(
+                    "Python is a general purpose programming language used "
+                    "for many kinds of software."
+                ),
+                metadata={
+                    "chunk_id": f"py-{i}",
+                    "document_hash": "doc-python",
+                    "source": "python_guide.txt",
+                    "file_name": "python_guide.txt",
+                    "file_type": "txt",
+                    "chunk_index": i,
+                    "chunk_size": 10,
+                },
+            )
+            for i in range(4)
+        ]
+        + [
+            Document(
+                page_content="Chocolate chocolate chocolate cake recipe with rich frosting.",
+                metadata={
+                    "chunk_id": "choc-1",
+                    "document_hash": "doc-chocolate",
+                    "source": "baking.pdf",
+                    "file_name": "baking.pdf",
+                    "file_type": "pdf",
+                    "page": 2,
+                    "chunk_index": 0,
+                    "chunk_size": 10,
+                },
+            )
+        ]
+    )
+    return store
+
+
+@pytest.fixture
+def two_document_retriever(tmp_path):
+    return DocumentRetriever(vector_store=_make_two_document_store(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "broad_question",
+    [
+        "Can you tell me details about both the documents?",
+        "Tell me about both documents.",
+        "Can you summarize both documents?",
+        "Give me details about the uploaded documents.",
+        "What are these documents about?",
+        "Compare the two documents.",
+        "What information is available in these documents?",
+    ],
+)
+def test_broad_multi_document_questions_retrieve_from_every_document(
+    two_document_retriever, broad_question
+):
+    fake_chat = FakeChatService(answer="Details covering both documents.")
+    service = RAGService(retriever=two_document_retriever, chat_service=fake_chat)
+
+    response = service.answer_question(broad_question, top_k=3)
+
+    document_hashes = {chunk.document_hash for chunk in response.retrieved_chunks}
+    assert document_hashes == {"doc-python", "doc-chocolate"}
+    source_files = {source.file_name for source in response.sources}
+    assert source_files == {"python_guide.txt", "baking.pdf"}
+
+
+def test_broad_question_answer_is_generated_from_both_documents_context(
+    two_document_retriever,
+):
+    scripted_chat = ScriptedChatService(answer_response="Summary of both documents.")
+    service = RAGService(retriever=two_document_retriever, chat_service=scripted_chat)
+
+    response = service.answer_question("Tell me about both documents.", top_k=3)
+
+    assert response.answer == "Summary of both documents."
+    _, user_prompt = scripted_chat.calls[-1]
+    assert "python_guide.txt" in user_prompt
+    assert "baking.pdf" in user_prompt
+
+
+def test_specific_single_document_question_still_answers_from_that_document(
+    two_document_retriever,
+):
+    """Preserve existing behavior: a question clearly about one document's
+    content is not derailed by the other document also being retrievable.
+    """
+    fake_chat = FakeChatService(answer="Python is used for many things.")
+    service = RAGService(retriever=two_document_retriever, chat_service=fake_chat)
+
+    response = service.answer_question("What is python python python used for?", top_k=3)
+
+    assert response.answer == "Python is used for many things."
+    assert response.retrieved_chunks[0].document_hash == "doc-python"
+
+
+def test_unrelated_question_still_returns_exact_fallback_with_two_documents(
+    two_document_retriever,
+):
+    """A question unrelated to either document's content still relies on
+    the model's own grounding judgment / no-context short-circuit, exactly
+    as for a single-document knowledge base.
+    """
+    fake_chat = FakeChatService(answer=NO_ANSWER_FALLBACK)
+    service = RAGService(retriever=two_document_retriever, chat_service=fake_chat)
+
+    response = service.answer_question("What is the capital of France?", top_k=3)
+
+    assert response.answer == NO_ANSWER_FALLBACK
