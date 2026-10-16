@@ -306,6 +306,62 @@ def test_list_documents_reflects_deletion(tmp_path):
     assert documents[0].document_hash == "hash-b"
 
 
+# --- get_chunks_by_index (neighbor-chunk lookup) ------------------------
+
+
+def test_get_chunks_by_index_returns_requested_chunks(tmp_path):
+    store = _make_store(tmp_path)
+    store.add_chunks(
+        [
+            _make_chunk("chunk zero", "doc-c0", document_hash="doc-1", chunk_index=0),
+            _make_chunk("chunk one", "doc-c1", document_hash="doc-1", chunk_index=1),
+            _make_chunk("chunk two", "doc-c2", document_hash="doc-1", chunk_index=2),
+        ]
+    )
+
+    results = store.get_chunks_by_index("doc-1", [0, 2])
+
+    texts = {doc.page_content for doc in results}
+    assert texts == {"chunk zero", "chunk two"}
+
+
+def test_get_chunks_by_index_never_crosses_documents(tmp_path):
+    store = _make_store(tmp_path)
+    store.add_chunks(
+        [
+            _make_chunk("doc one chunk", "doc1-c0", document_hash="doc-1", chunk_index=0),
+            _make_chunk("doc two chunk", "doc2-c0", document_hash="doc-2", chunk_index=0),
+        ]
+    )
+
+    results = store.get_chunks_by_index("doc-1", [0])
+
+    assert len(results) == 1
+    assert results[0].page_content == "doc one chunk"
+
+
+def test_get_chunks_by_index_returns_empty_for_missing_index(tmp_path):
+    store = _make_store(tmp_path)
+    store.add_chunks([_make_chunk("only chunk", "doc-c0", document_hash="doc-1", chunk_index=0)])
+
+    results = store.get_chunks_by_index("doc-1", [5])
+
+    assert results == []
+
+
+def test_get_chunks_by_index_rejects_invalid_document_hash(tmp_path):
+    store = _make_store(tmp_path)
+    with pytest.raises(VectorStoreError):
+        store.get_chunks_by_index("", [0])
+
+
+def test_get_chunks_by_index_with_empty_indexes_returns_empty(tmp_path):
+    store = _make_store(tmp_path)
+    store.add_chunks([_make_chunk("only chunk", "doc-c0", document_hash="doc-1", chunk_index=0)])
+
+    assert store.get_chunks_by_index("doc-1", []) == []
+
+
 def test_persistence_across_two_vector_store_instances(tmp_path):
     """Integration test: chunk -> (mocked) embed -> store -> reopen -> verify."""
     text = " ".join(f"Sentence number {i} about DocuMind." for i in range(80))

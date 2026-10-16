@@ -61,7 +61,14 @@ model's general knowledge).
   isolated chat history; no memory is ever shared across users.
 - **Document management UI** — upload, list, and delete indexed documents
   from the sidebar; duplicate/unchanged re-uploads are detected and skipped.
-- **229 automated tests**, all runnable fully offline (no API key required).
+- **445 automated tests** (last reported full-suite run), all runnable fully
+  offline (no API key required).
+- **Document-aware section metadata and wide-table repair** — see
+  [Advanced RAG Challenge Summary](docs/advanced-rag-challenge-summary.md)
+  for the evidence-backed, document-specific refinements added on top of
+  this pipeline (section-heading detection, coordinate-based repair for
+  PDF tables whose last column gets disconnected from its own rows, and
+  the validation behind each).
 
 ## Architecture: The RAG Pipeline
 
@@ -172,6 +179,7 @@ DocuMind-RAG-Chatbot/
 ├── ingestion/
 │   ├── loaders.py              # PDF/DOCX/TXT/Markdown parsing
 │   ├── chunking.py             # Recursive character chunking + chunk IDs
+│   ├── table_repair.py          # Coordinate-based repair for wide PDF tables
 │   ├── pipeline.py             # validate -> save -> parse -> chunk
 │   └── indexing_service.py     # chunks -> Gemini embeddings -> Chroma
 ├── retrieval/
@@ -189,7 +197,7 @@ DocuMind-RAG-Chatbot/
 │   ├── hashing.py                 # deterministic document/chunk IDs
 │   ├── validation.py              # file validation, filename sanitization
 │   └── logging_config.py
-├── tests/                      # 229 tests, fully offline
+├── tests/                      # 445 tests (last reported), fully offline
 ├── sample_documents/
 └── data/
     ├── uploads/                 # saved uploads (gitignored)
@@ -334,8 +342,8 @@ All configuration is read from environment variables (`.env`) via
 | `LLM_TEMPERATURE` | `0.0` | Generation temperature (deterministic for grounded QA) |
 | `MAX_CONTEXT_CHARS` | `12000` | Safety cap on total retrieved-context size sent to Gemini |
 | `MAX_FILE_SIZE_MB` | `20` | Maximum upload size |
-| `CHUNK_SIZE` | `800` | Characters per chunk |
-| `CHUNK_OVERLAP` | `120` | Overlap between consecutive chunks |
+| `CHUNK_SIZE` | `1200` | Characters per chunk |
+| `CHUNK_OVERLAP` | `200` | Overlap between consecutive chunks |
 | `CHROMA_COLLECTION_NAME` | `documind_documents` | Chroma collection name |
 | `VECTOR_STORE_BATCH_SIZE` | `100` | Batch size for Chroma writes |
 | `RETRIEVAL_TOP_K` | `5` | Chunks retrieved per question (UI slider: 1–10) |
@@ -347,13 +355,21 @@ All configuration is read from environment variables (`.env`) via
 pytest tests/ -q
 ```
 
-The full test suite (**229 tests**) runs entirely offline: Gemini calls are
+The full test suite (**445 tests** in the last reported full-suite run — see
+the [Advanced RAG Challenge Summary](docs/advanced-rag-challenge-summary.md)
+for validation details) runs entirely offline: Gemini calls are
 mocked and Chroma runs against a temporary directory, so no API key or
 network access is required. Coverage includes:
 
 - File validation, filename sanitization, and document loading (PDF, DOCX,
   TXT, Markdown)
-- Chunking: metadata preservation, overlap, deterministic/unique chunk IDs
+- Chunking: metadata preservation, overlap, deterministic/unique chunk IDs,
+  and document-specific `section_title` detection (see
+  [Advanced RAG Challenge Summary](docs/advanced-rag-challenge-summary.md))
+- Coordinate-based repair for wide PDF tables whose last column gets
+  disconnected from its own rows, including the conservative rule for
+  removing the resulting redundant tail only when fully accounted for
+  (`ingestion/table_repair.py`, `tests/test_table_repair.py`)
 - The Gemini embedding service and Chroma vector store (idempotent upserts,
   deletion, persistence across instances)
 - Semantic retrieval: query validation, top-K, ordering, multi-document

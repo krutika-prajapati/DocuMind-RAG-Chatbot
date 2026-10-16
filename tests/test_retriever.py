@@ -393,7 +393,9 @@ def test_broad_query_includes_every_indexed_document(tmp_path):
 
     document_hashes = {chunk.document_hash for chunk in results}
     assert document_hashes == {"doc-dominant", "doc-minority"}
-    assert len(results) == 3
+    # At least the requested top_k -- neighbor augmentation may add more
+    # (these chunks have adjacent chunk_index values within each document).
+    assert len(results) >= 3
 
 
 def test_diversified_results_are_still_sorted_by_distance(tmp_path):
@@ -402,8 +404,13 @@ def test_diversified_results_are_still_sorted_by_distance(tmp_path):
 
     results = retriever.retrieve("QUERY: broad neutral question", top_k=3)
 
-    distances = [chunk.distance for chunk in results]
-    assert distances == sorted(distances)
+    # The primary, authoritative portion (the requested top_k) stays sorted
+    # by relevance exactly as before -- any supplementary neighbor chunks
+    # appended after it borrow their anchor's distance and are not
+    # themselves independently ranked, so only this primary slice is
+    # guaranteed globally sorted.
+    primary_distances = [chunk.distance for chunk in results[:3]]
+    assert primary_distances == sorted(primary_distances)
 
 
 def test_query_specific_to_one_document_still_ranks_it_first(tmp_path):
@@ -471,8 +478,152 @@ def test_diversification_falls_back_to_flat_search_if_listing_documents_fails(
 
     results = retriever.retrieve("QUERY: broad neutral question", top_k=3)
 
-    # Degrades gracefully to a plain flat search rather than crashing.
-    assert len(results) == 3
+    # Degrades gracefully to a plain flat search rather than crashing. At
+    # least the requested top_k comes back -- neighbor augmentation may add
+    # more (these chunks have adjacent chunk_index values).
+    assert len(results) >= 3
+
+
+# --- Neighbor-chunk retrieval (content split across adjacent chunks of the
+# same document, e.g. a financial table, should be retrievable together) ---
+
+_NEIGHBOR_KEYWORDS = ["alpha", "beta", "gamma", "delta"]
+
+
+class NeighborKeywordEmbeddingService:
+    """Deterministic, per-chunk-keyword embedding -- each test chunk's
+    distinctive keyword lets a query be engineered to match exactly one
+    chunk as the clear top-1 result, so neighbor augmentation can be tested
+    in isolation from ranking/diversification concerns.
+    """
+
+    def embed_texts(self, texts):
+        return [self._vector(text) for text in texts]
+
+    def embed_text(self, text):
+        return self._vector(text)
+
+    @staticmethod
+    def _vector(text: str):
+        lowered = text.lower()
+        return [float(lowered.count(keyword)) for keyword in _NEIGHBOR_KEYWORDS]
+
+
+def _make_neighbor_store(tmp_path, **kwargs) -> ChromaVectorStore:
+    return ChromaVectorStore(
+        embedding_service=NeighborKeywordEmbeddingService(),
+        persist_directory=tmp_path,
+        **kwargs,
+    )
+
+
+def test_neighbor_of_first_chunk_is_added(tmp_path):
+    """A two-chunk document where chunk 0 is retrieved -> chunk 1 is added."""
+    store = _make_neighbor_store(tmp_path)
+    store.add_chunks(
+        [
+            _make_chunk("alpha alpha alpha opening balance.", "doc-c0", "doc-1", chunk_index=0),
+            _make_chunk("beta beta beta closing balance.", "doc-c1", "doc-1", chunk_index=1),
+        ]
+    )
+    retriever = DocumentRetriever(vector_store=store)
+
+    results = retriever.retrieve("alpha alpha alpha", top_k=1, document_hash="doc-1")
+
+    chunk_ids = {r.chunk_id for r in results}
+    assert chunk_ids == {"doc-c0", "doc-c1"}
+
+
+def test_neighbor_of_last_chunk_is_added(tmp_path):
+    """A two-chunk document where chunk 1 is retrieved -> chunk 0 is added."""
+    store = _make_neighbor_store(tmp_path)
+    store.add_chunks(
+        [
+            _make_chunk("alpha alpha alpha opening balance.", "doc-c0", "doc-1", chunk_index=0),
+            _make_chunk("beta beta beta closing balance.", "doc-c1", "doc-1", chunk_index=1),
+        ]
+    )
+    retriever = DocumentRetriever(vector_store=store)
+
+    results = retriever.retrieve("beta beta beta", top_k=1, document_hash="doc-1")
+
+    chunk_ids = {r.chunk_id for r in results}
+    assert chunk_ids == {"doc-c0", "doc-c1"}
+
+
+def test_middle_chunk_gets_both_neighbors(tmp_path):
+    store = _make_neighbor_store(tmp_path)
+    store.add_chunks(
+        [
+            _make_chunk("alpha alpha alpha first section.", "doc-c0", "doc-1", chunk_index=0),
+            _make_chunk("beta beta beta middle section.", "doc-c1", "doc-1", chunk_index=1),
+            _make_chunk("gamma gamma gamma last section.", "doc-c2", "doc-1", chunk_index=2),
+        ]
+    )
+    retriever = DocumentRetriever(vector_store=store)
+
+    results = retriever.retrieve("beta beta beta", top_k=1, document_hash="doc-1")
+
+    chunk_ids = {r.chunk_id for r in results}
+    assert chunk_ids == {"doc-c0", "doc-c1", "doc-c2"}
+
+
+def test_neighbor_from_a_different_document_is_not_added(tmp_path):
+    """chunk_index is only unique per document -- a different document's
+    chunk at the same neighboring index must never be pulled in.
+    """
+    store = _make_neighbor_store(tmp_path)
+    store.add_chunks(
+        [
+            _make_chunk("alpha alpha alpha only chunk of doc 1.", "doc1-c0", "doc-1", chunk_index=0),
+            _make_chunk("unrelated other-document chunk.", "doc2-c1", "doc-2", chunk_index=1),
+        ]
+    )
+    retriever = DocumentRetriever(vector_store=store)
+
+    results = retriever.retrieve("alpha alpha alpha", top_k=1, document_hash="doc-1")
+
+    chunk_ids = {r.chunk_id for r in results}
+    assert chunk_ids == {"doc1-c0"}
+    assert "doc2-c1" not in chunk_ids
+
+
+def test_neighbor_already_in_results_is_not_duplicated(tmp_path):
+    """If a neighbor is already independently present in the primary
+    results (e.g. both chunks rank in top-k on their own), it must not be
+    returned a second time as a "supplementary" neighbor.
+    """
+    store = _make_neighbor_store(tmp_path)
+    store.add_chunks(
+        [
+            _make_chunk("alpha alpha alpha beta beta beta.", "doc-c0", "doc-1", chunk_index=0),
+            _make_chunk("alpha alpha alpha beta beta beta.", "doc-c1", "doc-1", chunk_index=1),
+        ]
+    )
+    retriever = DocumentRetriever(vector_store=store)
+
+    results = retriever.retrieve("alpha alpha alpha beta beta beta", top_k=2)
+
+    chunk_ids = [r.chunk_id for r in results]
+    assert chunk_ids.count("doc-c0") == 1
+    assert chunk_ids.count("doc-c1") == 1
+    assert len(results) == 2
+
+
+def test_retrieval_is_unaffected_when_no_neighbor_exists(tmp_path):
+    """Existing retrieval behavior remains valid when no neighbor exists:
+    a document with only one chunk has no neighbor to add.
+    """
+    store = _make_neighbor_store(tmp_path)
+    store.add_chunks(
+        [_make_chunk("alpha alpha alpha the only chunk.", "doc-only", "doc-1", chunk_index=0)]
+    )
+    retriever = DocumentRetriever(vector_store=store)
+
+    results = retriever.retrieve("alpha alpha alpha", top_k=1, document_hash="doc-1")
+
+    assert len(results) == 1
+    assert results[0].chunk_id == "doc-only"
 
 
 def test_end_to_end_chunk_embed_store_query_retrieve(tmp_path):
@@ -509,7 +660,9 @@ def test_end_to_end_chunk_embed_store_query_retrieve(tmp_path):
     retriever = DocumentRetriever(vector_store=store)
     results = retriever.retrieve("python python python", top_k=2)
 
-    assert len(results) == 2
+    # At least the requested top_k -- neighbor augmentation may add more
+    # (both documents' chunks here have adjacent chunk_index values).
+    assert len(results) >= 2
     assert results[0].document_hash == python_hash
     assert results[0].chunk_id in {chunk.metadata["chunk_id"] for chunk in python_chunks}
     assert isinstance(results[0], RetrievedChunk)

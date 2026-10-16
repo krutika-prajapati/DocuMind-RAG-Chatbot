@@ -92,6 +92,13 @@ class DocumentRetriever:
         store has no indexed chunks (or none match an optional
         document_hash filter) — this never crashes and never calls an
         answer-generation LLM.
+
+        After the similarity search, each result's immediate same-document
+        neighbor chunks (chunk_index +/- 1) are additionally fetched and
+        appended as supplementary context (see _augment_with_neighbors) --
+        this never reorders or removes the original results, so content
+        split across two adjacent chunks (e.g. a financial table) is more
+        likely to be answerable from a single retrieve() call.
         """
         validated_query = self._validate_query(query)
 
@@ -116,7 +123,79 @@ class DocumentRetriever:
                 "Failed to search the knowledge base. Please try again."
             ) from exc
 
-        return [self._to_retrieved_chunk(document, distance) for document, distance in results]
+        augmented_results = self._augment_with_neighbors(results)
+        return [
+            self._to_retrieved_chunk(document, distance)
+            for document, distance in augmented_results
+        ]
+
+    def _augment_with_neighbors(
+        self, results: List[Tuple[Document, float]]
+    ) -> List[Tuple[Document, float]]:
+        """Supplement similarity results with each result's immediate
+        same-document chunk neighbors (chunk_index - 1 and chunk_index + 1).
+
+        Content such as a financial table or a multi-page note is sometimes
+        split across two adjacent chunks by the character-based splitter; a
+        question needing both halves may otherwise only retrieve one of
+        them. This never reorders or replaces the original results -- they
+        stay first, exactly as similarity search ranked them -- neighbors
+        are appended afterward as supplementary context, deduplicated by
+        chunk_id, and only ever looked up within the SAME document_hash as
+        the result that requested them (chunk_index is only unique per
+        document, never globally). If a neighbor lookup fails, the original
+        results are still returned unchanged -- this never breaks retrieval.
+        """
+        if not results:
+            return results
+
+        seen_chunk_ids = {
+            document.metadata.get("chunk_id")
+            for document, _distance in results
+            if document.metadata.get("chunk_id") is not None
+        }
+
+        # For every result, note which neighbor chunk_index values to fetch
+        # per document_hash, keeping the best (lowest) distance among the
+        # anchors that requested each index.
+        wanted: Dict[str, Dict[int, float]] = {}
+        for document, distance in results:
+            document_hash = document.metadata.get("document_hash")
+            chunk_index = document.metadata.get("chunk_index")
+            if document_hash is None or not isinstance(chunk_index, int):
+                continue
+            for neighbor_index in (chunk_index - 1, chunk_index + 1):
+                if neighbor_index < 0:
+                    continue
+                per_document = wanted.setdefault(document_hash, {})
+                if neighbor_index not in per_document or distance < per_document[neighbor_index]:
+                    per_document[neighbor_index] = distance
+
+        supplementary: List[Tuple[Document, float]] = []
+        for document_hash, indexes_to_distance in wanted.items():
+            try:
+                neighbor_documents = self._vector_store.get_chunks_by_index(
+                    document_hash, list(indexes_to_distance.keys())
+                )
+            except VectorStoreError as exc:
+                logger.warning(
+                    "Could not fetch neighbor chunks for a result; continuing "
+                    "without them (%s).",
+                    type(exc).__name__,
+                )
+                continue
+
+            for neighbor_document in neighbor_documents:
+                chunk_id = neighbor_document.metadata.get("chunk_id")
+                if chunk_id is not None and chunk_id in seen_chunk_ids:
+                    continue
+                if chunk_id is not None:
+                    seen_chunk_ids.add(chunk_id)
+                neighbor_index = neighbor_document.metadata.get("chunk_index")
+                anchor_distance = indexes_to_distance.get(neighbor_index, 0.0)
+                supplementary.append((neighbor_document, anchor_distance))
+
+        return results + supplementary
 
     def _search_across_all_documents(
         self, query: str, top_k: int

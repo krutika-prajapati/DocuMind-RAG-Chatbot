@@ -180,6 +180,50 @@ class ChromaVectorStore:
                 "Failed to search the vector store. Please try again."
             ) from exc
 
+    def get_chunks_by_index(
+        self, document_hash: str, chunk_indexes: List[int]
+    ) -> List[Document]:
+        """Return the stored chunks for one document at specific chunk_index values.
+
+        A direct metadata lookup (not a similarity search) used to fetch a
+        result's immediate neighbor chunks (chunk_index ± 1) so content split
+        across adjacent chunks of the same document is more likely to be
+        retrieved together. Never returns chunks from a different
+        document_hash — chunk_index is only unique within one document.
+        Returns an empty list if none of the requested indexes exist for
+        this document (e.g. the result is already at the first or last
+        chunk_index) or if chunk_indexes is empty.
+        """
+        if not document_hash or not isinstance(document_hash, str):
+            raise VectorStoreError("document_hash must be a non-empty string.")
+        if not chunk_indexes:
+            return []
+
+        try:
+            result = self._store.get(
+                where={
+                    "$and": [
+                        {"document_hash": document_hash},
+                        {"chunk_index": {"$in": list(chunk_indexes)}},
+                    ]
+                },
+                include=["documents", "metadatas"],
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to fetch neighbor chunks from Chroma (%s).", type(exc).__name__
+            )
+            raise VectorStoreError(
+                "Failed to fetch neighboring chunks. Please try again."
+            ) from exc
+
+        texts = result.get("documents") or []
+        metadatas = result.get("metadatas") or []
+        return [
+            Document(page_content=text, metadata=metadata or {})
+            for text, metadata in zip(texts, metadatas)
+        ]
+
     def list_documents(self) -> List[IndexedDocument]:
         """Return a summary of every distinct document currently indexed.
 

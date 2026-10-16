@@ -11,6 +11,7 @@ from docx import Document as DocxDocument
 from langchain_core.documents import Document
 from pypdf import PdfReader
 
+from ingestion.table_repair import repair_wide_table_columns
 from utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -32,10 +33,29 @@ def _base_metadata(file_path: Path, file_type: str) -> Dict[str, str]:
 
 
 def load_pdf_document(file_path: Path) -> List[Document]:
-    """Load a PDF file, returning one Document per page with page numbers."""
+    """Load a PDF file, returning one Document per page with page numbers.
+
+    Each page's extracted text is additionally passed through
+    repair_wide_table_columns(), which only ever changes a page when a
+    conservative, evidence-based signature (a wide table's last column
+    disconnected from its own rows) is detected -- see
+    ingestion/table_repair.py. Every other page, including every page of
+    documents that never exhibit this defect, comes back byte-identical.
+    """
     try:
         reader = PdfReader(str(file_path))
-        page_texts = [page.extract_text() or "" for page in reader.pages]
+        page_texts = []
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            try:
+                text = repair_wide_table_columns(page, text)
+            except Exception:
+                logger.warning(
+                    "Wide-table column repair failed for a page; using the "
+                    "original extracted text for that page instead.",
+                    exc_info=True,
+                )
+            page_texts.append(text)
     except Exception as exc:
         logger.exception("Failed to parse PDF file: %s", file_path)
         raise DocumentParsingError(_UNREADABLE_MESSAGE) from exc
