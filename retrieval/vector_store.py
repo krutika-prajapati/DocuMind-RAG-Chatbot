@@ -107,10 +107,20 @@ class ChromaVectorStore:
         updates them in place instead of creating duplicates, so this is
         safe to call repeatedly for the same document. Returns the number
         of chunks stored.
+
+        All-or-nothing: a large document is embedded in several batches
+        (VECTOR_STORE_BATCH_SIZE at a time), and if a later batch fails
+        (e.g. a rate limit that outlasted the embedding service's own
+        retries) after earlier batches already succeeded, those earlier
+        batches are rolled back before raising. Without this, the document
+        would be left permanently half-indexed, and -- since indexing is
+        skipped for a document_hash that already has any chunks stored --
+        a retry would silently never complete it.
         """
         self._validate_chunks(chunks)
 
         chunk_ids = [chunk.metadata["chunk_id"] for chunk in chunks]
+        added_ids: List[str] = []
 
         try:
             stored = 0
@@ -118,13 +128,38 @@ class ChromaVectorStore:
                 batch_chunks = chunks[start : start + self._batch_size]
                 batch_ids = chunk_ids[start : start + self._batch_size]
                 self._store.add_documents(documents=batch_chunks, ids=batch_ids)
+                added_ids.extend(batch_ids)
                 stored += len(batch_chunks)
             return stored
         except Exception as exc:
             logger.error("Failed to add chunks to Chroma (%s).", type(exc).__name__)
+            self._rollback_partial_add(added_ids)
             raise VectorStoreError(
                 "Failed to store document chunks. Please try again."
             ) from exc
+
+    def _rollback_partial_add(self, added_ids: List[str]) -> None:
+        """Best-effort delete of chunk ids already added before a later
+        batch failed. Never raises -- a failed rollback is logged clearly
+        so the resulting partial state is visible, but it never replaces
+        or hides the original error that triggered the rollback.
+        """
+        if not added_ids:
+            return
+        try:
+            self._store.delete(ids=added_ids)
+            logger.warning(
+                "Rolled back %d partially-added chunk(s) after a failed "
+                "add_chunks() call, so this document is not left half-indexed.",
+                len(added_ids),
+            )
+        except Exception:
+            logger.error(
+                "Failed to roll back %d partially-added chunk(s) after a failed "
+                "add_chunks() call -- the vector store may now contain an "
+                "incomplete set of this document's chunks.",
+                len(added_ids),
+            )
 
     def delete_document(self, document_hash: str) -> int:
         """Delete every chunk belonging to one uploaded document.

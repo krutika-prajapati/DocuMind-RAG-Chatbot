@@ -395,3 +395,98 @@ def test_persistence_across_two_vector_store_instances(tmp_path):
     result = reopened_store._store.get(ids=[first_chunk_id], include=["documents", "metadatas"])
     assert result["documents"] == [chunks[0].page_content]
     assert result["metadatas"][0]["document_hash"] == document_hash
+
+
+class FlakyEmbeddingService:
+    """Succeeds on the first `fail_after` embed_texts() calls, then raises
+    -- simulates a later batch of a multi-batch add_chunks() call hitting a
+    persistent embedding failure (e.g. a rate limit that outlasted the
+    embedding service's own retries) after earlier batches already
+    succeeded.
+    """
+
+    def __init__(self, fail_after: int):
+        self.fail_after = fail_after
+        self.call_count = 0
+
+    def embed_texts(self, texts):
+        self.call_count += 1
+        if self.call_count > self.fail_after:
+            raise RuntimeError("simulated persistent embedding failure")
+        return [[float(len(text)), 0.0] for text in texts]
+
+    def embed_text(self, text):
+        return [float(len(text)), 0.0]
+
+
+def test_add_chunks_rolls_back_earlier_batches_when_a_later_batch_fails(tmp_path):
+    # batch_size=2 with 4 chunks -> 2 batches; the embedding service
+    # succeeds for the first batch and fails for the second.
+    store = ChromaVectorStore(
+        embedding_service=FlakyEmbeddingService(fail_after=1),
+        persist_directory=tmp_path,
+        batch_size=2,
+    )
+    chunks = [
+        _make_chunk(f"chunk {i} text", f"id-{i}", document_hash="doc-flaky")
+        for i in range(4)
+    ]
+
+    with pytest.raises(VectorStoreError):
+        store.add_chunks(chunks)
+
+    # The first batch's 2 chunks must not be left behind -- otherwise this
+    # document_hash would look "already indexed" on a later retry and the
+    # document would be permanently stuck half-indexed.
+    assert store.get_stats()["total_chunks"] == 0
+
+
+def test_add_chunks_retry_after_rollback_succeeds_cleanly(tmp_path):
+    """After a rollback, re-adding the same chunks (as a real retry would
+    do) must succeed normally -- confirming no orphaned state from the
+    failed attempt blocks it."""
+    flaky_service = FlakyEmbeddingService(fail_after=1)
+    store = ChromaVectorStore(
+        embedding_service=flaky_service, persist_directory=tmp_path, batch_size=2
+    )
+    chunks = [
+        _make_chunk(f"chunk {i} text", f"id-{i}", document_hash="doc-flaky")
+        for i in range(4)
+    ]
+
+    with pytest.raises(VectorStoreError):
+        store.add_chunks(chunks)
+    assert store.get_stats()["total_chunks"] == 0
+
+    flaky_service.fail_after = 999  # let every batch succeed this time
+    flaky_service.call_count = 0
+    stored = store.add_chunks(chunks)
+
+    assert stored == 4
+    assert store.get_stats()["total_chunks"] == 4
+
+
+def test_add_chunks_logs_when_rollback_itself_fails(tmp_path, caplog):
+    """If the rollback delete also fails, the original error must still
+    be raised (not replaced), and the failed rollback must be logged so
+    the resulting partial state is visible rather than silent."""
+    store = ChromaVectorStore(
+        embedding_service=FlakyEmbeddingService(fail_after=1),
+        persist_directory=tmp_path,
+        batch_size=2,
+    )
+    chunks = [
+        _make_chunk(f"chunk {i} text", f"id-{i}", document_hash="doc-flaky")
+        for i in range(4)
+    ]
+
+    def broken_delete(ids):
+        raise RuntimeError("Chroma delete also unavailable")
+
+    store._store.delete = broken_delete
+
+    with caplog.at_level("ERROR"):
+        with pytest.raises(VectorStoreError, match="Failed to store document chunks"):
+            store.add_chunks(chunks)
+
+    assert "Failed to roll back" in caplog.text

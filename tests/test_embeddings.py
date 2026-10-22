@@ -7,9 +7,51 @@ tests never require a GOOGLE_API_KEY or network access.
 import logging
 
 import pytest
+from google.genai.errors import ClientError
 from langchain_core.documents import Document
+from langchain_google_genai._common import GoogleGenerativeAIError
 
+import retrieval.embeddings as embeddings_module
 from retrieval.embeddings import EmbeddingServiceError, GeminiEmbeddingService
+
+
+def _rate_limit_error(retry_delay: str = "2s") -> GoogleGenerativeAIError:
+    """Build a realistic wrapped 429, matching what langchain_google_genai
+    actually raises: the real google-genai ClientError as __cause__, with
+    Google's own reported retryDelay inside its structured details -- the
+    same shape seen in this application's own production logs."""
+    client_error = ClientError(
+        429,
+        {
+            "error": {
+                "code": 429,
+                "message": "You exceeded your current quota.",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": retry_delay,
+                    }
+                ],
+            }
+        },
+    )
+    wrapped = GoogleGenerativeAIError(
+        "Error embedding content (RESOURCE_EXHAUSTED): " + str(client_error)
+    )
+    wrapped.__cause__ = client_error
+    return wrapped
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sleep(monkeypatch):
+    """Every test in this file must run fast regardless of configured
+    retry delays -- real waiting would make the suite slow and still
+    wouldn't be testing anything network-related, since no real call is
+    ever made here."""
+    recorded = []
+    monkeypatch.setattr(embeddings_module.time, "sleep", lambda seconds: recorded.append(seconds))
+    return recorded
 
 
 class FakeGoogleEmbeddings:
@@ -223,3 +265,111 @@ def test_get_embedding_dimension_returns_vector_length(patched_embeddings):
     dimension = service.get_embedding_dimension()
 
     assert dimension == 3  # FakeGoogleEmbeddings.embed_query returns a 3-element vector
+
+
+class FlakyGoogleEmbeddings:
+    """Raises a retryable 429 on the first `fail_count` calls, then
+    succeeds -- used to verify the retry-with-backoff behavior without
+    ever making a real request."""
+
+    def __init__(self, fail_count: int = 0, retry_delay: str = "2s", **kwargs):
+        self.fail_count = fail_count
+        self.retry_delay = retry_delay
+        self.call_count = 0
+
+    def embed_query(self, text):
+        self.call_count += 1
+        if self.call_count <= self.fail_count:
+            raise _rate_limit_error(self.retry_delay)
+        return [float(len(text))]
+
+    def embed_documents(self, texts, batch_size=None):
+        self.call_count += 1
+        if self.call_count <= self.fail_count:
+            raise _rate_limit_error(self.retry_delay)
+        return [[float(len(text))] for text in texts]
+
+
+def _patch_flaky(monkeypatch, **kwargs):
+    instance = FlakyGoogleEmbeddings(**kwargs)
+    monkeypatch.setattr(
+        "retrieval.embeddings.GoogleGenerativeAIEmbeddings", lambda **_: instance
+    )
+    return instance
+
+
+def test_embed_text_retries_on_rate_limit_then_succeeds(monkeypatch):
+    instance = _patch_flaky(monkeypatch, fail_count=2)
+    service = GeminiEmbeddingService(model="models/gemini-embedding-001")
+
+    vector = service.embed_text("hello")
+
+    assert vector == [5.0]
+    assert instance.call_count == 3  # 2 failures + 1 success
+
+
+def test_embed_texts_retries_on_rate_limit_then_succeeds(monkeypatch):
+    instance = _patch_flaky(monkeypatch, fail_count=1)
+    service = GeminiEmbeddingService(model="models/gemini-embedding-001")
+
+    vectors = service.embed_texts(["a", "bb"])
+
+    assert vectors == [[1.0], [2.0]]
+    assert instance.call_count == 2
+
+
+def test_retry_honors_googles_reported_retry_delay(monkeypatch, _no_real_sleep):
+    _patch_flaky(monkeypatch, fail_count=1, retry_delay="7s")
+    service = GeminiEmbeddingService(model="models/gemini-embedding-001")
+
+    service.embed_text("hello")
+
+    assert _no_real_sleep == [7.0]
+
+
+def test_retry_falls_back_to_default_delay_when_not_reported(monkeypatch, _no_real_sleep):
+    _patch_flaky(monkeypatch, fail_count=1, retry_delay="")
+    service = GeminiEmbeddingService(model="models/gemini-embedding-001")
+
+    service.embed_text("hello")
+
+    assert _no_real_sleep == [embeddings_module._DEFAULT_RETRY_DELAY_SECONDS]
+
+
+def test_gives_up_after_max_retries_and_raises(monkeypatch, _no_real_sleep):
+    instance = _patch_flaky(monkeypatch, fail_count=999)  # always fails
+    service = GeminiEmbeddingService(model="models/gemini-embedding-001")
+
+    with pytest.raises(EmbeddingServiceError):
+        service.embed_text("hello")
+
+    # initial attempt + _MAX_EMBEDDING_RETRIES retries, never more
+    assert instance.call_count == embeddings_module._MAX_EMBEDDING_RETRIES + 1
+    assert len(_no_real_sleep) == embeddings_module._MAX_EMBEDDING_RETRIES
+
+
+def test_non_retryable_error_fails_immediately_without_sleeping(monkeypatch, _no_real_sleep):
+    class AlwaysBadRequest:
+        def __init__(self, **kwargs):
+            self.call_count = 0
+
+        def embed_query(self, text):
+            self.call_count += 1
+            client_error = ClientError(
+                400, {"error": {"code": 400, "message": "bad request", "status": "INVALID_ARGUMENT"}}
+            )
+            wrapped = GoogleGenerativeAIError(str(client_error))
+            wrapped.__cause__ = client_error
+            raise wrapped
+
+    instance = AlwaysBadRequest()
+    monkeypatch.setattr(
+        "retrieval.embeddings.GoogleGenerativeAIEmbeddings", lambda **_: instance
+    )
+    service = GeminiEmbeddingService(model="models/gemini-embedding-001")
+
+    with pytest.raises(EmbeddingServiceError):
+        service.embed_text("hello")
+
+    assert instance.call_count == 1  # no retry for a non-retryable status code
+    assert _no_real_sleep == []
